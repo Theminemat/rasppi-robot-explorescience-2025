@@ -1,4 +1,3 @@
-
 import time
 import threading
 import random
@@ -50,7 +49,7 @@ class GyroSensor:
                 self._use_smbus = False
 
         if not self._use_smbus:
-            # no library/device available; leave dev as None so callers know
+            # no library/device available
             self.dev = None
 
     def get_gyro_z(self):
@@ -90,9 +89,6 @@ class GyroSensor:
 
 
 class UltrasonicSensor:
-    """Wrapper for HC-SR04. If RPi.GPIO isn't available, returns mock distances.
-    Initialize with TRIG and ECHO BCM pin numbers.
-    """
     def __init__(self, trig_pin=None, echo_pin=None):
         self.trig = trig_pin
         self.echo = echo_pin
@@ -130,25 +126,19 @@ class UltrasonicSensor:
 
 
 class HeadingTracker:
-    """Integrate gyro z-rate to produce a heading in degrees within [0, 360).
-    Supports reset() to declare the current heading as 0.
-    """
+  
     def __init__(self, gyro_sensor, poll_interval=0.05, sign=1, axis='z', min_rate_thresh=0.5, drift_correction_dps=-0.1):
         self.gyro = gyro_sensor
         self.poll = poll_interval
         self._raw = 0.0
         self._offset = 0.0
-        # sign: 1 keeps gyro sign as-is, -1 inverts rotation direction used for integration
         self.sign = 1 if sign >= 0 else -1
-        # axis: 'x','y' or 'z' - which gyro axis to integrate
         self.axis = axis.lower()
-        # minimum absolute gyro rate (deg/s) required to integrate; prevents slow drift from noise
         self.min_rate_thresh = float(min_rate_thresh)
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
-        # apply a small constant correction (deg/s) to counteract slow gyro drift
-        # default is -0.1 deg/s (subtract 0.1 degrees every second)
+        # gyro drift correction
         self.drift_correction_dps = float(drift_correction_dps)
 
     def start(self):
@@ -169,10 +159,8 @@ class HeadingTracker:
             now = time.time()
             dt = now - last
             last = now
-            # pick the correct gyro axis getter
             getter = getattr(self.gyro, f'get_gyro_{self.axis}', None)
             if getter is None:
-                # fallback to z
                 rate = self.gyro.get_gyro('z')
             else:
                 try:
@@ -180,19 +168,16 @@ class HeadingTracker:
                 except Exception:
                     rate = 0.0
 
-            # if gyro appears to be a mock/unavailable, or rate is tiny, skip integration to avoid drift
             is_gyro_mock = (getattr(self.gyro, 'dev', None) is None) and (not getattr(self.gyro, '_use_smbus', False))
             if rate is None:
                 rate = 0.0
             if is_gyro_mock or abs(rate) < self.min_rate_thresh:
-                # nothing to integrate; just sleep and continue
                 time.sleep(max(0.0, self.poll - 0.0))
                 last = time.time()
                 continue
 
-            # apply configurable sign so sensor wrapper stays untouched
             delta = (self.sign * rate) * dt
-            # small constant drift correction (deg/s * dt)
+            # small drift correction (deg/s * dt)
             correction_delta = (self.drift_correction_dps) * dt
             with self._lock:
                 self._raw = fmod((self._raw + delta + correction_delta), 360.0)
@@ -209,35 +194,22 @@ class HeadingTracker:
 
     def reset(self):
         with self._lock:
-            # make current raw heading become 0
             self._offset = self._raw
 
 
-# Instantiate sensors using BCM pin numbers from your pin map (see raspberry-pins.txt)
 gyro = GyroSensor()
 sensor_front = UltrasonicSensor(trig_pin=15, echo_pin=14)  # front TRIG=BCM15, ECHO=BCM14
 sensor_right = UltrasonicSensor(trig_pin=23, echo_pin=24)  # right TRIG=BCM23, ECHO=BCM24
 
-# Invert gyro sign to match physical orientation of the sensor.
-# Keep only a single HeadingTracker for the Z axis (heading) as requested.
-# Apply a stronger drift correction (-0.5 deg/s) and allow correction even when
-# the measured rate is very small by setting min_rate_thresh=0.0.
+# Invert gyro 
 tracker_z = HeadingTracker(gyro, sign=-1, axis='z', drift_correction_dps=-0.476, min_rate_thresh=0.0)
 tracker_z.start()
 
-# Log sensor modes so it's obvious on startup whether real GPIO is used
 print(f'INFO: sensor_front mock={sensor_front.mock}, sensor_right mock={sensor_right.mock}, HAS_GPIO={HAS_GPIO}, HAS_MPU={HAS_MPU}')
 print(f'INFO: gyro mock={(gyro.dev is None)}')
 
-# --- Motor controller for L298N (uses BCM pins from raspberry-pins.txt) ---
 class MotorController:
-    """Simple motor controller for four motors (L298N). Expects BCM pin numbers.
-    Motor naming: front_left, back_left, front_right, back_right
-    Each motor uses two GPIO pins (A,B). We'll use A for PWM control and B as direction flip.
-    This is a simple abstraction sufficient for forward/backward/rotate.
-    """
     def __init__(self, pins=None, pwm_freq=1000):
-        # pins: dict(name -> (a_pin, b_pin))
         default = {
             'front_left': (13, 6),
             'back_left': (26, 19),
@@ -246,34 +218,28 @@ class MotorController:
         }
         self.pins = pins or default
         self.pwms = {}
-        # If your wiring makes positive speeds drive backwards, set this True to flip direction
         self.invert_direction = True
         self.enabled = HAS_GPIO
         if self.enabled:
             GPIO.setmode(GPIO.BCM)
             for name, (a, b) in self.pins.items():
-                # initialize direction pin to a safe known state BEFORE enabling PWM
                 GPIO.setup(a, GPIO.OUT)
                 GPIO.setup(b, GPIO.OUT)
                 GPIO.output(b, GPIO.LOW)
                 pwm = GPIO.PWM(a, pwm_freq)
-                # start PWM with 0 duty to ensure motor is stopped
                 pwm.start(0.0)
                 self.pwms[name] = (pwm, b)
         else:
             print('INFO: GPIO not available, MotorController will operate in mock mode.')
 
     def set_motor(self, name, speed):
-        """Set motor speed in range [-1.0, 1.0]. Positive = forward.
-        Speed is applied as PWM duty cycle (0-100) on pin A; pin B controls direction.
-        """
+
         speed = max(-1.0, min(1.0, float(speed)))
         if not self.enabled:
             print(f'MOCK motor {name} set to {speed:.2f}')
             return
         pwm, b_pin = self.pwms[name]
         duty = abs(speed) * 100.0
-        # apply global inversion if wiring is reversed
         dir_forward = True if speed >= 0 else False
         if getattr(self, 'invert_direction', False):
             dir_forward = not dir_forward
@@ -287,23 +253,16 @@ class MotorController:
         for name in self.pwms:
             pwm, b = self.pwms[name]
             pwm.ChangeDutyCycle(0.0)
-            # leave direction pins in safe (LOW) state
             try:
                 GPIO.output(b, GPIO.LOW)
             except Exception:
                 pass
 
 
-# Instantiate motor controller (safe mock if no GPIO) and ensure stopped at startup
 motors = MotorController()
 motors.stop_all()
 
-# Helper: rotate in place to a relative heading (degrees can be positive or negative).
 def _rotate_in_place(degrees, rot_speed=0.4, tol_deg=4.0, timeout=8.0):
-    """Rotate the robot in place by `degrees` (signed). Blocks until done or aborted.
-    Returns True on success, False if aborted via _stop_event or timeout.
-    """
-    # normalize target heading
     start = tracker_z.get_heading()
     target = (start + float(degrees)) % 360.0
 
@@ -333,13 +292,11 @@ def _rotate_in_place(degrees, rot_speed=0.4, tol_deg=4.0, timeout=8.0):
                 return False
             now = tracker_z.get_heading()
             diff = shortest_angle_diff(now, target)
-            # Stoppen, wenn Ziel überschritten wurde (Richtungswechsel im diff)
             if last_diff is not None and (diff == 0 or (last_diff > 0 and diff < 0) or (last_diff < 0 and diff > 0)):
                 print(f"INFO: rotate_in_place überschritten: now={now:.2f}, target={target:.2f}, diff={diff:.2f}")
                 break
             if abs(diff) <= tol_deg:
                 break
-            # rotate towards target via shortest path
             if diff > 0:
                 rotate_ccw(rot_speed)
             else:
@@ -352,21 +309,11 @@ def _rotate_in_place(degrees, rot_speed=0.4, tol_deg=4.0, timeout=8.0):
         motors.stop_all()
 
 
-# Worker to run the corner-handling sequence (ecken_handling)
 _collect_lock = threading.Lock()
 _stop_event = threading.Event()
-COOLDOWN_SECONDS = 15.0  # Cooldown-Mechanismus für automatische Drehung (8s)
+COOLDOWN_SECONDS = 15.0  # Cooldown-Mechanismus für auto-drehung
 _last_auto_turn_time = 0.0
 def ecken_handling_sequence():
-    """Simplified corner handling: when a front obstacle is detected while
-    driving forward, perform exactly three steps:
-      1) rotate clockwise for 1s
-      2) drive backward for 1s
-      3) rotate to (start_heading - 90°) relative to the heading when the
-         sequence started
-
-    The function respects _stop_event and ensures motors are stopped on exit.
-    """
     global _last_auto_turn_time
     try:
         speed = 0.6
@@ -508,40 +455,27 @@ def api_stop_motors():
 
 @app.route('/api/turn_left', methods=['POST'])
 def api_turn_left():
-    """Immediately rotate -90 degrees (left/CCW) without backing up.
-    This will signal any running collect sequence to stop, perform the turn,
-    then return the result.
-    """
-    # remember if the collect (ecken_handling) sequence was running so we
-    # can resume it after the manual rotation
     try:
         was_collect_running = _collect_lock.locked()
     except Exception:
         was_collect_running = False
 
-    # request immediate stop of any background sequence
     _stop_event.set()
-    # wait briefly for a running collect thread to exit and release the lock
     wait_start = time.time()
     while time.time() - wait_start < 1.5:
-        # try to acquire the collect lock briefly to test if it's held
         acquired = _collect_lock.acquire(blocking=False)
         if acquired:
-            # no collector was running (or it released): release and continue
             _collect_lock.release()
             break
         time.sleep(0.05)
 
-    # clear stop so the rotation helper won't immediately abort
     _stop_event.clear()
     try:
         ok = _rotate_in_place(-90.0, rot_speed=0.45, tol_deg=4.0, timeout=8.0)
     except Exception:
         ok = False
 
-    # If the collect sequence was running before the manual turn, restart it
     if was_collect_running:
-        # Try to start the collect worker (same logic as api_start_collect)
         if _collect_lock.acquire(blocking=False):
             def _worker():
                 try:
@@ -557,8 +491,6 @@ def api_turn_left():
 
 @app.route('/api/turn_right', methods=['POST'])
 def api_turn_right():
-    """Immediately rotate +90 degrees (right/CW) without backing up.
-    """
     try:
         was_collect_running = _collect_lock.locked()
     except Exception:
@@ -594,7 +526,6 @@ def api_turn_right():
 
 @app.route('/api/start_collect', methods=['POST'])
 def api_start_collect():
-    # start the ecken_handling sequence in a background thread; prevent concurrent runs
     if not _collect_lock.acquire(blocking=False):
         return jsonify({'status': 'already_running'})
 
@@ -616,7 +547,6 @@ def index():
 
 @app.route('/control')
 def control():
-    """Serve a minimal full-screen control page with two big buttons (left/right)."""
     return send_from_directory(app.static_folder, 'control.html')
 
 
@@ -630,7 +560,6 @@ def api_status():
         right = sensor_right.get_distance_cm()
     except Exception:
         right = None
-    # get live gyro rates per axis (deg/s). Use try/except in case the sensor read fails
     try:
         gx = gyro.get_gyro_x()
     except Exception:
@@ -644,10 +573,8 @@ def api_status():
     except Exception:
         gz = None
 
-    # collect heading (Z axis) from the tracker
     hz = tracker_z.get_heading()
 
-    # Cooldown für automatische Drehung anzeigen (Restzeit in Sekunden)
     global _last_auto_turn_time, COOLDOWN_SECONDS
     cooldown_left = max(0.0, COOLDOWN_SECONDS - (time.time() - _last_auto_turn_time))
     return jsonify({
@@ -658,7 +585,6 @@ def api_status():
         'timestamp': int(time.time()),
         'gyro_rate_z_dps': None if gz is None else round(gz, 2),
         'gyro_is_mock': bool(gyro.dev is None),
-        # rotation direction (Z axis)
         'rotation_dir_z': (None if gz is None else ('CW' if (tracker_z.sign * gz) > 0 else ('CCW' if (tracker_z.sign * gz) < 0 else 'stopped'))),
         'heading_z_deg': round(hz, 2),
         'auto_turn_cooldown': round(cooldown_left, 1)
@@ -672,5 +598,4 @@ def api_reset_heading():
 
 
 if __name__ == '__main__':
-    # Use 0.0.0.0 so the UI is reachable from other devices on the LAN
     app.run(host='0.0.0.0', port=5000, debug=False)
