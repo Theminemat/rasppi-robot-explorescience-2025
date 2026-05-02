@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""Ultrasonic sensor tester: choose 'front' or 'right' to test the corresponding HC-SR04.
-
-Usage:
-  python3 ultra_test.py --sensor front
-  python3 ultra_test.py --sensor right
-
-Pins (BCM):
-  front: TRIG=15, ECHO=14
-  right: TRIG=23, ECHO=24
-
-The script prints continuous distance measurements (cm) until Ctrl+C.
-"""
 import time
 import argparse
 
@@ -26,7 +13,6 @@ SENSOR_MAP = {
 }
 
 def measure_once(trig, echo):
-    # perform one HC-SR04 measurement
     GPIO.output(trig, False)
     time.sleep(0.0002)
     GPIO.output(trig, True)
@@ -63,7 +49,6 @@ def main():
 
     if not HAS_GPIO:
         print('RPi.GPIO not available. Running in mock mode (no hardware).')
-        # Simple mock: print varying values
         i = 0
         try:
             while args.count == 0 or i < args.count:
